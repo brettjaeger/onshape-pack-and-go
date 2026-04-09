@@ -1,1 +1,6 @@
 .env
+.claude/
+.venv/
+.ipynb_checkpoints/
+*.zip
+
