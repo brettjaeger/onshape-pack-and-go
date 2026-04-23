@@ -261,7 +261,8 @@ def find_released_drawings(parts, did):
                 part = pn_rev_lookup[(pn, rev)]
                 print(f"    ✓ '{name}' (pn={pn}, rev={rev}) → '{part['name']}'")
                 found[eid] = {"id": eid, "name": name, "documentId": did,
-                              "wvm": "v", "wvmid": vid, "partNumber": pn, "revision": rev}
+                              "wvm": "v", "wvmid": vid, "partNumber": pn, "revision": rev,
+                              "partName": part["name"]}
                 done.add(eid)
             else:
                 # pn matches but revision doesn't — keep scanning older versions
@@ -338,15 +339,18 @@ def main(assembly_url):
 
     print(f"\nExporting STEP files...")
     step_files = {}
+    step_base = {}  # (partNumber, revision) -> base filename without extension
     for part in parts:
         print(f"  {part['name']} ...", end=" ", flush=True)
         try:
             data = export_step(part)
-            fname = f"{part['partNumber']}-{part['revision']}.step"
+            part_safe = re.sub(r'[^\w\-.]', '_', part['name'])
+            fname = f"{part['partNumber']}-{part['revision']}-{part_safe}.step"
             path = os.path.join(folder_name, fname)
             with open(path, "wb") as f:
                 f.write(data)
             step_files[fname] = data
+            step_base[(part['partNumber'], part['revision'])] = fname[:-5]
             print("✓")
         except Exception as e:
             print(f"✗ ({e})")
@@ -371,7 +375,12 @@ def main(assembly_url):
         print(f"  {drawing['name']} ...", end=" ", flush=True)
         try:
             data = export_pdf(drawing)
-            fname = f"{drawing['partNumber']}-{drawing['revision']}.pdf"
+            base = step_base.get((drawing['partNumber'], drawing['revision']))
+            if base:
+                fname = base + ".pdf"
+            else:
+                part_safe = re.sub(r'[^\w\-.]', '_', drawing['partName'])
+                fname = f"{drawing['partNumber']}-{drawing['revision']}-{part_safe}.pdf"
             path = os.path.join(folder_name, fname)
             with open(path, "wb") as f:
                 f.write(data)
