@@ -174,38 +174,78 @@ def get_drawing_metadata(did, wvm, wvmid, eid):
         return "", "", ""
 
 
-def find_linked_drawings(parts, did, wvm, wvmid):
-    """Find drawings whose part number matches a released part's part number."""
-    elements = api_get(f"/documents/d/{did}/{wvm}/{wvmid}/elements")
-    drawing_els = [el for el in elements
-                   if el.get("elementType") == "APPLICATION"
-                   and el.get("dataType") == "onshape-app/drawing"]
+def find_released_drawings(parts, did):
+    """
+    Scan all document versions (newest first) to find released drawings matching
+    the given parts. Released state only exists in the version where the release
+    occurred, so a single-version scan misses drawings released at other times.
+    """
+    ws_id = get_workspace(did)
+    if not ws_id:
+        return []
 
+    # Get complete drawing element list from the workspace
+    try:
+        elements = api_get(f"/documents/d/{did}/w/{ws_id}/elements")
+    except Exception:
+        return []
+
+    drawing_els = {
+        el["id"]: el.get("name", el["id"])
+        for el in elements
+        if el.get("elementType") == "APPLICATION"
+        and el.get("dataType") == "onshape-app/drawing"
+    }
     print(f"  Found {len(drawing_els)} drawing(s) in document.")
 
-    # Build lookup: partNumber -> part (for parts in this document)
-    pn_lookup = {}
-    for p in parts:
-        if p["partNumber"]:
-            pn_lookup[p["partNumber"]] = p
+    # Lookup by (partNumber, revision) for exact matching
+    pn_rev_lookup = {(p["partNumber"], p["revision"]): p for p in parts if p["partNumber"]}
+    pn_only_lookup = {p["partNumber"] for p in parts if p["partNumber"]}
 
-    linked = []
-    for el in drawing_els:
-        d_eid  = el["id"]
-        d_name = el.get("name", d_eid)
-        pn, _, state = get_drawing_metadata(did, wvm, wvmid, d_eid)
+    try:
+        versions = api_get(f"/documents/{did}/versions")
+    except Exception:
+        versions = []
 
-        # State "2" = Released (matches the BOM enum we observed)
-        if state != "2":
-            print(f"    ✗ '{d_name}' skipped (not released, state={state!r})")
-            continue
+    found = {}     # eid -> drawing dict (pn + rev matched a BOM part)
+    done = set()   # eids to stop scanning: matched or pn not in BOM at all
+    wrong_rev = {} # eid -> (pn, rev) of the most recent release with wrong revision
 
-        if pn and pn in pn_lookup:
-            part = pn_lookup[pn]
-            print(f"    ✓ '{d_name}' (pn={pn}) → '{part['name']}'")
-            linked.append({"id": d_eid, "name": d_name, "documentId": did, "wvm": wvm, "wvmid": wvmid})
+    for ver in versions:
+        vid = ver["id"]
+        unresolved = [eid for eid in drawing_els if eid not in done]
+        if not unresolved:
+            break
+        for eid in unresolved:
+            pn, rev, state = get_drawing_metadata(did, "v", vid, eid)
+            if state != "2":
+                continue
+            name = drawing_els[eid]
+            if pn not in pn_only_lookup:
+                # pn doesn't match any BOM part — no point scanning older versions
+                done.add(eid)
+                if pn:
+                    print(f"    ✗ '{name}' skipped (pn={pn!r} not in released BOM)")
+            elif (pn, rev) in pn_rev_lookup:
+                part = pn_rev_lookup[(pn, rev)]
+                print(f"    ✓ '{name}' (pn={pn}, rev={rev}) → '{part['name']}'")
+                found[eid] = {"id": eid, "name": name, "documentId": did,
+                              "wvm": "v", "wvmid": vid, "partNumber": pn, "revision": rev}
+                done.add(eid)
+            else:
+                # pn matches but revision doesn't — keep scanning older versions
+                if eid not in wrong_rev:
+                    wrong_rev[eid] = (pn, rev)
 
-    return linked
+    for eid, name in drawing_els.items():
+        if eid not in found:
+            if eid in wrong_rev:
+                pn, rev = wrong_rev[eid]
+                print(f"    ✗ '{name}' skipped (pn={pn!r} released at rev={rev!r}, not in BOM)")
+            elif eid not in done:
+                print(f"    ✗ '{name}' skipped (not released in any version)")
+
+    return list(found.values())
 
 
 # ── Step 5: Export drawings as PDF ───────────────────────────────────────────
@@ -243,13 +283,12 @@ def main(assembly_url):
     print(f"  Element:   {eid}")
 
     assembly_name = get_assembly_name(did, wvm, wvmid, eid)
-    folder_name = re.sub(r'[^\w\-.]', '_', assembly_name)
-    parts_dir   = os.path.join(folder_name, "parts")
-    drawings_dir = os.path.join(folder_name, "drawings")
-    os.makedirs(parts_dir, exist_ok=True)
-    os.makedirs(drawings_dir, exist_ok=True)
+    safe_name = re.sub(r'[^\w\-.]', '_', assembly_name)
+    exports_dir = os.path.join(os.path.dirname(__file__), "Exports")
+    folder_name = os.path.join(exports_dir, safe_name)
+    os.makedirs(folder_name, exist_ok=True)
     print(f"  Assembly:  {assembly_name}")
-    print(f"  Output folder: {folder_name}/")
+    print(f"  Output folder: Exports/{safe_name}/")
 
     print(f"\nFetching released parts from BOM...")
     parts = get_released_parts(did, wvm, wvmid, eid)
@@ -267,9 +306,8 @@ def main(assembly_url):
         print(f"  {part['name']} ...", end=" ", flush=True)
         try:
             data = export_step(part)
-            safe = re.sub(r'[^\w\-.]', '_', part['name'])
-            fname = f"{safe}.step"
-            path = os.path.join(parts_dir, fname)
+            fname = f"{part['partNumber']}-{part['revision']}.step"
+            path = os.path.join(folder_name, fname)
             with open(path, "wb") as f:
                 f.write(data)
             step_files[fname] = data
@@ -288,10 +326,8 @@ def main(assembly_url):
     linked_drawings = []
     for doc_did, info in docs.items():
         label = "assembly document" if doc_did == did else f"external document {doc_did}"
-        print(f"  Scanning {label} (version {info['wvmid']})...")
-        linked_drawings += find_linked_drawings(
-            info["parts"], doc_did, info["wvm"], info["wvmid"]
-        )
+        print(f"  Scanning {label}...")
+        linked_drawings += find_released_drawings(info["parts"], doc_did)
 
     print(f"\nExporting PDF drawings...")
     pdf_files = {}
@@ -299,9 +335,8 @@ def main(assembly_url):
         print(f"  {drawing['name']} ...", end=" ", flush=True)
         try:
             data = export_pdf(drawing)
-            safe = re.sub(r'[^\w\-.]', '_', drawing['name'])
-            fname = f"{safe}.pdf"
-            path = os.path.join(drawings_dir, fname)
+            fname = f"{drawing['partNumber']}-{drawing['revision']}.pdf"
+            path = os.path.join(folder_name, fname)
             with open(path, "wb") as f:
                 f.write(data)
             pdf_files[fname] = data
@@ -310,21 +345,19 @@ def main(assembly_url):
             print(f"✗ ({e})")
 
     print(f"\nPackaging ZIP...")
-    zip_name = f"{folder_name}.zip"
+    zip_name = os.path.join(exports_dir, f"{safe_name}.zip")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for fname, data in step_files.items():
-            zf.writestr(f"{folder_name}/parts/{fname}", data)
+            zf.writestr(f"{safe_name}/{fname}", data)
         for fname, data in pdf_files.items():
-            zf.writestr(f"{folder_name}/drawings/{fname}", data)
+            zf.writestr(f"{safe_name}/{fname}", data)
 
     with open(zip_name, "wb") as f:
         f.write(buf.getvalue())
 
-    print(f"  ✓ Folder: {folder_name}/")
-    print(f"    parts/    — {len(step_files)} STEP file(s)")
-    print(f"    drawings/ — {len(pdf_files)} PDF file(s)")
-    print(f"  ✓ ZIP: {zip_name} ({len(buf.getvalue()) / 1024:.1f} KB)")
+    print(f"  ✓ Folder: Exports/{safe_name}/  ({len(step_files)} STEP, {len(pdf_files)} PDF)")
+    print(f"  ✓ ZIP: Exports/{safe_name}.zip ({len(buf.getvalue()) / 1024:.1f} KB)")
 
 
 if __name__ == "__main__":
