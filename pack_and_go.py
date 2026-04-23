@@ -174,11 +174,20 @@ def get_drawing_metadata(did, wvm, wvmid, eid):
         return "", "", ""
 
 
+def _normalize_drawing_name(name):
+    """Strip trailing drawing suffixes (e.g. 'Drawing 1', 'DWG 2') for name matching."""
+    name = re.sub(r'[\s\-_]+(drawing|dwg|drw)[\s\-_]*\d*\s*$', '', name, flags=re.IGNORECASE)
+    return name.strip().lower()
+
+
 def find_released_drawings(parts, did):
     """
     Scan all document versions (newest first) to find released drawings matching
     the given parts. Released state only exists in the version where the release
     occurred, so a single-version scan misses drawings released at other times.
+
+    Drawings are pre-filtered by name (stripping suffixes like 'Drawing 1') to
+    avoid scanning unrelated drawings in documents with many elements.
     """
     ws_id = get_workspace(did)
     if not ws_id:
@@ -190,13 +199,35 @@ def find_released_drawings(parts, did):
     except Exception:
         return []
 
-    drawing_els = {
+    all_drawing_els = {
         el["id"]: el.get("name", el["id"])
         for el in elements
         if el.get("elementType") == "APPLICATION"
         and el.get("dataType") == "onshape-app/drawing"
     }
-    print(f"  Found {len(drawing_els)} drawing(s) in document.")
+    print(f"  Found {len(all_drawing_els)} drawing(s) in document.")
+
+    # Pre-filter by name: only scan drawings whose name (minus drawing suffix)
+    # matches a part name. This avoids expensive version scans for unrelated drawings.
+    part_names = {p["name"].strip().lower() for p in parts}
+    drawing_els = {
+        eid: name for eid, name in all_drawing_els.items()
+        if _normalize_drawing_name(name) in part_names
+    }
+
+    # If any part has no name-matched candidate, fall back to scanning all drawings
+    # so we don't miss drawings with non-standard naming conventions.
+    matched_names = {_normalize_drawing_name(name) for name in drawing_els.values()}
+    unmatched_parts = [p for p in parts if p["name"].strip().lower() not in matched_names]
+    if unmatched_parts:
+        print(f"  ⚠ No name-matched drawing for: {', '.join(p['name'] for p in unmatched_parts)}")
+        print(f"  Falling back to scanning all {len(all_drawing_els)} drawing(s).")
+        drawing_els = all_drawing_els
+    else:
+        skipped_count = len(all_drawing_els) - len(drawing_els)
+        if skipped_count:
+            print(f"  Pre-filtered to {len(drawing_els)} candidate(s) by name "
+                  f"({skipped_count} drawing(s) don't match any part name).")
 
     # Lookup by (partNumber, revision) for exact matching
     pn_rev_lookup = {(p["partNumber"], p["revision"]): p for p in parts if p["partNumber"]}
@@ -230,7 +261,8 @@ def find_released_drawings(parts, did):
                 part = pn_rev_lookup[(pn, rev)]
                 print(f"    ✓ '{name}' (pn={pn}, rev={rev}) → '{part['name']}'")
                 found[eid] = {"id": eid, "name": name, "documentId": did,
-                              "wvm": "v", "wvmid": vid, "partNumber": pn, "revision": rev}
+                              "wvm": "v", "wvmid": vid, "partNumber": pn, "revision": rev,
+                              "partName": part["name"]}
                 done.add(eid)
             else:
                 # pn matches but revision doesn't — keep scanning older versions
@@ -244,6 +276,11 @@ def find_released_drawings(parts, did):
                 print(f"    ✗ '{name}' skipped (pn={pn!r} released at rev={rev!r}, not in BOM)")
             elif eid not in done:
                 print(f"    ✗ '{name}' skipped (not released in any version)")
+
+    matched_pn_revs = {(d["partNumber"], d["revision"]) for d in found.values()}
+    for p in parts:
+        if p["partNumber"] and (p["partNumber"], p["revision"]) not in matched_pn_revs:
+            print(f"  ⚠ No drawing found for '{p['name']}' (pn={p['partNumber']}, rev={p['revision']})")
 
     return list(found.values())
 
@@ -302,15 +339,18 @@ def main(assembly_url):
 
     print(f"\nExporting STEP files...")
     step_files = {}
+    step_base = {}  # (partNumber, revision) -> base filename without extension
     for part in parts:
         print(f"  {part['name']} ...", end=" ", flush=True)
         try:
             data = export_step(part)
-            fname = f"{part['partNumber']}-{part['revision']}.step"
+            part_safe = re.sub(r'[^\w\-.]', '_', part['name'])
+            fname = f"{part['partNumber']}-{part['revision']}-{part_safe}.step"
             path = os.path.join(folder_name, fname)
             with open(path, "wb") as f:
                 f.write(data)
             step_files[fname] = data
+            step_base[(part['partNumber'], part['revision'])] = fname[:-5]
             print("✓")
         except Exception as e:
             print(f"✗ ({e})")
@@ -335,7 +375,12 @@ def main(assembly_url):
         print(f"  {drawing['name']} ...", end=" ", flush=True)
         try:
             data = export_pdf(drawing)
-            fname = f"{drawing['partNumber']}-{drawing['revision']}.pdf"
+            base = step_base.get((drawing['partNumber'], drawing['revision']))
+            if base:
+                fname = base + ".pdf"
+            else:
+                part_safe = re.sub(r'[^\w\-.]', '_', drawing['partName'])
+                fname = f"{drawing['partNumber']}-{drawing['revision']}-{part_safe}.pdf"
             path = os.path.join(folder_name, fname)
             with open(path, "wb") as f:
                 f.write(data)
