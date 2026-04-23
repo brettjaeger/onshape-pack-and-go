@@ -406,7 +406,8 @@ def main(assembly_url):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python pack_and_go.py <assembly_url>")
-        sys.exit(1)
-    main(sys.argv[1])
+    if len(sys.argv) >= 2:
+        url = sys.argv[1]
+    else:
+        url = input("Paste assembly URL: ").strip()
+    main(url)
