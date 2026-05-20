@@ -10,7 +10,7 @@ Exports all released parts (STEP) and their linked drawings (PDF) from an Onshap
 4. Exports each drawing as a **PDF**
 5. Saves everything to `Exports/{assembly_name}/` and packages it as a ZIP
 
-Files are named `PartNumber-Revision-PartName` (e.g. `RRP-504-A-Hard_Stop_Block.step` / `RRP-504-A-Hard_Stop_Block.pdf`).
+Files are named `PartNumber-Revision-PartName` (e.g. `PRT-504-A-Test_Part_1.step` / `PRT-504-A-Test_Part_1.pdf`).
 
 ## Requirements
 
