@@ -31,13 +31,20 @@ POLL_TIMEOUT = 300
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
+api_call_count = 0
+
+
 def api_get(path, query=None):
+    global api_call_count
+    api_call_count += 1
     resp = requests.get(BASE_URL + path, auth=AUTH, headers=HEADERS, params=query)
     resp.raise_for_status()
     return resp.json()
 
 
 def api_post(path, body=None, query=None):
+    global api_call_count
+    api_call_count += 1
     resp = requests.post(BASE_URL + path, auth=AUTH,
                          headers={**HEADERS, "Content-Type": "application/json"},
                          params=query, json=body)
@@ -46,6 +53,8 @@ def api_post(path, body=None, query=None):
 
 
 def api_get_binary(path, query=None):
+    global api_call_count
+    api_call_count += 1
     resp = requests.get(BASE_URL + path, auth=AUTH,
                         headers={"Accept": "application/octet-stream"},
                         params=query)
@@ -53,20 +62,38 @@ def api_get_binary(path, query=None):
     return resp.content
 
 
-def poll_translation(translation_id, doc_id):
+def poll_all_translations(pending):
+    """
+    Poll a batch of in-flight translations to completion.
+
+    pending: dict of label -> {"id": translation_id, "doc_id": doc_id}
+    Returns: dict of label -> file bytes (failures are omitted; errors printed inline)
+    """
+    results = {}
     deadline = time.time() + POLL_TIMEOUT
-    while time.time() < deadline:
-        status = api_get(f"/translations/{translation_id}")
-        state = status.get("requestState", "")
-        if state == "DONE":
-            ext_ids = status.get("resultExternalDataIds") or []
-            if not ext_ids:
-                raise RuntimeError(f"Translation {translation_id} done but no files returned.")
-            return api_get_binary(f"/documents/d/{doc_id}/externaldata/{ext_ids[0]}")
-        elif state == "FAILED":
-            raise RuntimeError(f"Translation failed: {status.get('failureReason')}")
-        time.sleep(POLL_INTERVAL)
-    raise TimeoutError(f"Translation {translation_id} timed out after {POLL_TIMEOUT}s")
+    while pending and time.time() < deadline:
+        still_pending = {}
+        for label, job in pending.items():
+            status = api_get(f"/translations/{job['id']}")
+            state = status.get("requestState", "")
+            if state == "DONE":
+                ext_ids = status.get("resultExternalDataIds") or []
+                if not ext_ids:
+                    print(f"  ✗ {label} (translation done but no files returned)")
+                else:
+                    results[label] = api_get_binary(
+                        f"/documents/d/{job['doc_id']}/externaldata/{ext_ids[0]}")
+                    print(f"  ✓ {label}")
+            elif state == "FAILED":
+                print(f"  ✗ {label} (translation failed: {status.get('failureReason')})")
+            else:
+                still_pending[label] = job
+        pending = still_pending
+        if pending:
+            time.sleep(POLL_INTERVAL)
+    for label in pending:
+        print(f"  ✗ {label} (timed out after {POLL_TIMEOUT}s)")
+    return results
 
 
 # ── Step 1: Parse URL ─────────────────────────────────────────────────────────
@@ -137,18 +164,14 @@ def get_released_parts(did, wvm, wvmid, eid):
 
 # ── Step 3: Export parts as STEP ─────────────────────────────────────────────
 
-def export_step(part):
-    p_did   = part["documentId"]
-    p_wvm   = part["wvmType"]
-    p_wvmid = part["wvmId"]
-    p_eid   = part["elementId"]
-    part_id = part["partId"]
-
+def start_step_translation(part):
+    """Start a STEP translation and return {id, doc_id} without polling."""
     result = api_post(
-        f"/partstudios/d/{p_did}/{p_wvm}/{p_wvmid}/e/{p_eid}/translations",
-        body={"formatName": "STEP", "partIds": part_id, "storeInDocument": False},
+        f"/partstudios/d/{part['documentId']}/{part['wvmType']}/{part['wvmId']}"
+        f"/e/{part['elementId']}/translations",
+        body={"formatName": "STEP", "partIds": part["partId"], "storeInDocument": False},
     )
-    return poll_translation(result["id"], p_did)
+    return {"id": result["id"], "doc_id": part["documentId"]}
 
 
 # ── Step 4: Find linked drawings ──────────────────────────────────────────────
@@ -233,6 +256,20 @@ def find_released_drawings(parts, did):
     pn_rev_lookup = {(p["partNumber"], p["revision"]): p for p in parts if p["partNumber"]}
     pn_only_lookup = {p["partNumber"] for p in parts if p["partNumber"]}
 
+    # Workspace pre-filter: fetch metadata once per drawing from workspace.
+    # Drawings whose part number doesn't appear in the BOM at all can be
+    # skipped entirely — no need to scan any versions for them.
+    print(f"  Pre-checking {len(drawing_els)} drawing(s) via workspace metadata...")
+    version_candidates = {}  # eid -> name, for drawings worth scanning versions
+    for eid, name in drawing_els.items():
+        pn, _, _ = get_drawing_metadata(did, "w", ws_id, eid)
+        if pn and pn not in pn_only_lookup:
+            print(f"    ✗ '{name}' skipped (pn={pn!r} not in released BOM)")
+        else:
+            version_candidates[eid] = name
+    drawing_els = version_candidates
+    print(f"  {len(drawing_els)} drawing(s) need version scanning.")
+
     try:
         versions = api_get(f"/documents/{did}/versions")
     except Exception:
@@ -287,17 +324,14 @@ def find_released_drawings(parts, did):
 
 # ── Step 5: Export drawings as PDF ───────────────────────────────────────────
 
-def export_pdf(drawing):
-    did   = drawing["documentId"]
-    wvm   = drawing["wvm"]
-    wvmid = drawing["wvmid"]
-    d_eid = drawing["id"]
-
+def start_pdf_translation(drawing):
+    """Start a PDF translation and return {id, doc_id} without polling."""
+    did = drawing["documentId"]
     result = api_post(
-        f"/drawings/d/{did}/{wvm}/{wvmid}/e/{d_eid}/translations",
+        f"/drawings/d/{did}/{drawing['wvm']}/{drawing['wvmid']}/e/{drawing['id']}/translations",
         body={"formatName": "PDF", "storeInDocument": False},
     )
-    return poll_translation(result["id"], did)
+    return {"id": result["id"], "doc_id": did}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -338,22 +372,30 @@ def main(assembly_url):
         return
 
     print(f"\nExporting STEP files...")
-    step_files = {}
     step_base = {}  # (partNumber, revision) -> base filename without extension
+    part_by_label = {}  # label -> part
+    pending_steps = {}  # label -> {id, doc_id}
     for part in parts:
-        print(f"  {part['name']} ...", end=" ", flush=True)
+        part_safe = re.sub(r'[^\w\-. ]', '_', part['name'])
+        label = f"{part['partNumber']}-{part['revision']}-{part_safe}.step"
+        part_by_label[label] = part
         try:
-            data = export_step(part)
-            part_safe = re.sub(r'[^\w\-.]', '_', part['name'])
-            fname = f"{part['partNumber']}-{part['revision']}-{part_safe}.step"
-            path = os.path.join(folder_name, fname)
-            with open(path, "wb") as f:
-                f.write(data)
-            step_files[fname] = data
-            step_base[(part['partNumber'], part['revision'])] = fname[:-5]
-            print("✓")
+            pending_steps[label] = start_step_translation(part)
+            print(f"  Started: {part['name']}")
         except Exception as e:
-            print(f"✗ ({e})")
+            print(f"  ✗ {part['name']} ({e})")
+
+    print(f"  Waiting for {len(pending_steps)} translation(s)...")
+    step_results = poll_all_translations(pending_steps)
+
+    step_files = {}
+    for fname, data in step_results.items():
+        part = part_by_label[fname]
+        path = os.path.join(folder_name, fname)
+        with open(path, "wb") as f:
+            f.write(data)
+        step_files[fname] = data
+        step_base[(part['partNumber'], part['revision'])] = fname[:-5]
 
     print(f"\nFinding linked drawings...")
     docs = {}
@@ -370,24 +412,31 @@ def main(assembly_url):
         linked_drawings += find_released_drawings(info["parts"], doc_did)
 
     print(f"\nExporting PDF drawings...")
-    pdf_files = {}
+    drawing_by_label = {}  # label -> drawing
+    pending_pdfs = {}      # label -> {id, doc_id}
     for drawing in linked_drawings:
-        print(f"  {drawing['name']} ...", end=" ", flush=True)
+        base = step_base.get((drawing['partNumber'], drawing['revision']))
+        if base:
+            label = base + ".pdf"
+        else:
+            part_safe = re.sub(r'[^\w\-. ]', '_', drawing['partName'])
+            label = f"{drawing['partNumber']}-{drawing['revision']}-{part_safe}.pdf"
+        drawing_by_label[label] = drawing
         try:
-            data = export_pdf(drawing)
-            base = step_base.get((drawing['partNumber'], drawing['revision']))
-            if base:
-                fname = base + ".pdf"
-            else:
-                part_safe = re.sub(r'[^\w\-.]', '_', drawing['partName'])
-                fname = f"{drawing['partNumber']}-{drawing['revision']}-{part_safe}.pdf"
-            path = os.path.join(folder_name, fname)
-            with open(path, "wb") as f:
-                f.write(data)
-            pdf_files[fname] = data
-            print("✓")
+            pending_pdfs[label] = start_pdf_translation(drawing)
+            print(f"  Started: {drawing['name']}")
         except Exception as e:
-            print(f"✗ ({e})")
+            print(f"  ✗ {drawing['name']} ({e})")
+
+    print(f"  Waiting for {len(pending_pdfs)} translation(s)...")
+    pdf_results = poll_all_translations(pending_pdfs)
+
+    pdf_files = {}
+    for fname, data in pdf_results.items():
+        path = os.path.join(folder_name, fname)
+        with open(path, "wb") as f:
+            f.write(data)
+        pdf_files[fname] = data
 
     print(f"\nPackaging ZIP...")
     zip_name = os.path.join(exports_dir, f"{safe_name}.zip")
@@ -403,6 +452,7 @@ def main(assembly_url):
 
     print(f"  ✓ Folder: Exports/{safe_name}/  ({len(step_files)} STEP, {len(pdf_files)} PDF)")
     print(f"  ✓ ZIP: Exports/{safe_name}.zip ({len(buf.getvalue()) / 1024:.1f} KB)")
+    print(f"\nTotal Onshape API calls: {api_call_count}")
 
 
 if __name__ == "__main__":
